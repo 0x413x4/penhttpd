@@ -11,6 +11,7 @@ import os
 import ssl
 import sys
 import argparse
+import subprocess
 
 """===============================================
             PERSISTENT CONFIGURATION
@@ -75,9 +76,18 @@ def cprint(text):
 
 
 def generate_certificate():
-    command = "openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -subj '/CN=localhost' -nodes"
-    os.system(command)
-    pass
+    import subprocess
+    command = ["openssl", "req", "-x509", "-newkey", "rsa:4096", "-keyout", "key.pem", 
+               "-out", "cert.pem", "-days", "365", "-subj", "/CN=localhost", "-nodes"]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        print("[+] Certificate generated successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"[-] Error generating certificate: {e.stderr}")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("[-] OpenSSL not found. Please install OpenSSL.")
+        sys.exit(1)
 
 
 class penhttpdRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
@@ -159,7 +169,19 @@ class penhttpdRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
             self.send_response(100)
             self.end_headers()
 
-        con_length = int(self.headers['Content-Length'])
+        # Validate Content-Length header
+        try:
+            con_length = int(self.headers.get('Content-Length', 0))
+            # Limit content length to 100MB to prevent DoS
+            max_content_length = 100 * 1024 * 1024  # 100MB
+            if con_length < 0:
+                raise ValueError("Content-Length cannot be negative")
+            if con_length > max_content_length:
+                raise ValueError(f"Content-Length exceeds maximum allowed size of {max_content_length} bytes")
+        except (ValueError, TypeError) as e:
+            self.send_error(400, f"Invalid Content-Length header: {e}")
+            return ""
+        
         return self.rfile.read(con_length).decode('UTF-8')
 
     def send_post(self):
@@ -215,7 +237,8 @@ class penhttpdRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(fs[6]))
             self.end_headers()
             return f
-        except Exception:
+        except (IOError, OSError) as e:
+            print(f"[-] Error handling POST request: {e}")
             f.close()
             raise
 
@@ -223,12 +246,20 @@ class penhttpdRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
 def _print_start_message():
     print("[*] Server started")
     print("|--> Host   : {}".format(host))
+    if host == "0.0.0.0":
+        print("     WARNING: Server is listening on all network interfaces (0.0.0.0)")
+        print("     This may expose the server to external networks. Consider using 127.0.0.1 for local testing.")
     print("|--> Port   : {}".format(port))
     print("|--> Root   : {}".format(os.getcwd()))
-    print("|--> Host   : {}".format(host))
     if https:
         print("|--> Cert   : {}".format(cert))
-    print("|--> Verbose: {}\n".format(verbose))
+        print("|--> TLS    : Minimum version TLSv1.2")
+    else:
+        print("     WARNING: Server is running without HTTPS. Data will be transmitted in plain text.")
+    print("|--> Verbose: {}".format(verbose))
+    if verbose:
+        print("     WARNING: Verbose mode enabled. Sensitive data may be logged.")
+    print("")
 
 
 def start_server():
@@ -241,23 +272,22 @@ def start_server():
             os.chdir(workingdir)
 
         if https:
+            # Create SSL context with secure defaults
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            
+            # Load certificate and key
             if not os.path.isfile(cert):
                 print("[+] Generate certificate")
                 generate_certificate()
-                penhttpd.socket = ssl.wrap_socket(penhttpd.socket,
-                                                  certfile="cert.pem",
-                                                  keyfile="key.pem",
-                                                  server_side=True)
-
+                ssl_context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
             elif privkey:
-                penhttpd.socket = ssl.wrap_socket(penhttpd.socket,
-                                                  certfile=cert,
-                                                  keyfile=privkey,
-                                                  server_side=True)
+                ssl_context.load_cert_chain(certfile=cert, keyfile=privkey)
             else:
-                penhttpd.socket = ssl.wrap_socket(penhttpd.socket,
-                                                  certfile=cert,
-                                                  server_side=True)
+                ssl_context.load_cert_chain(certfile=cert)
+            
+            # Wrap socket with secure SSL context
+            penhttpd.socket = ssl_context.wrap_socket(penhttpd.socket, server_side=True)
         _print_start_message()
         penhttpd.serve_forever()
 
